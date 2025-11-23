@@ -3,9 +3,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-# ---------------------------
-# Helper modules / functions
-# ---------------------------
+"""
+This script implements a prototype-augmented Vision Transformer architecture
+designed specifically for hyperspectral image (HSI) understanding. The model
+introduces several key components that replace traditional self-attention with a
+spectral–spatial token routing mechanism that is both efficient and interpretable.
+
+---------------------------------------------------------------------
+1. SpectralEncoder
+---------------------------------------------------------------------
+The SpectralEncoder compresses the high-dimensional spectral signatures of each
+pixel using a lightweight 1D convolutional stack. Hyperspectral images contain
+tens to hundreds of wavelength bands; this module mixes these bands and produces
+a compact spectral embedding for each pixel. The encoder operates independently
+per spatial location, enabling effective per-pixel spectral feature extraction.
+
+---------------------------------------------------------------------
+2. topk_mask_from_logits
+---------------------------------------------------------------------
+This is a utility function that sparsifies routing logits by retaining only the
+top-k highest-scoring entries and masking the rest. After masking, a softmax is
+applied to renormalize the weights. This creates sparse, high-confidence
+assignments of tokens to prototypes and enforces efficient routing behavior.
+
+---------------------------------------------------------------------
+3. DualKeyBank
+---------------------------------------------------------------------
+The DualKeyBank stores two distinct sets of learnable prototypes:
+    - Spectral prototypes (capture wavelength-dependent information)
+    - Spatial prototypes  (capture geometric or texture-based patterns)
+
+Each set may operate in two modes:
+    (a) Learnable: optimized directly through gradient descent.
+    (b) EMA (Exponential Moving Average): updated using data-driven feature
+        aggregation without explicit gradient flow. This stabilizes prototype
+        learning and mirrors mechanisms used in DINO/MoCo-style self-supervision.
+
+The class also provides an ema_update() function to update prototypes based on
+token assignments.
+
+---------------------------------------------------------------------
+4. HSIKeyBankAttention
+---------------------------------------------------------------------
+This is the core attention mechanism and the central contribution of the model.
+Rather than computing keys from linear projections (as in a standard ViT), this
+module constructs keys dynamically from spectral and spatial prototype banks.
+
+The forward pass performs:
+    (1) Q, K, V projection as in standard multi-head attention.
+    (2) Routing: each token predicts soft assignments to spectral and spatial 
+        prototypes using learnable linear layers.
+    (3) Sparsification: top-k routing masks ensure that each token selects only
+        a few prototypes, improving efficiency and interpretability.
+    (4) Prototype aggregation: the selected prototypes are combined to produce
+        “effective keys,” which replace standard K in attention.
+    (5) Linearized attention: a fast, memory-efficient attention formulation is
+        used instead of full softmax(QKᵀ), enabling larger token counts.
+    (6) Contrastive loss (optional): encourages tokens to stay close to the
+        prototypes they route to, sharpening prototype semantics.
+    (7) Diversity loss: encourages prototypes within a head to remain distinct.
+    (8) EMA updates: if enabled, prototypes are updated based on token features.
+
+This mechanism unifies prototype learning with attention, blending spectral and
+spatial reasoning into a single efficient operator.
+
+---------------------------------------------------------------------
+5. newViTBlockHSI
+---------------------------------------------------------------------
+A transformer block that integrates:
+    - Layer normalization
+    - The proposed prototype-based attention mechanism
+    - An MLP feed-forward network
+    - Residual connections
+
+It replaces the self-attention component of a standard ViT with the
+HSIKeyBankAttention module, allowing the network to reason over learned spectral
+and spatial prototype concepts at every stage.
+
+---------------------------------------------------------------------
+Overall Architecture
+---------------------------------------------------------------------
+The overall model replaces traditional attention with a hybrid
+prototype-driven spectral–spatial routing mechanism and augments it with
+contrastive and diversity regularizers. This structure is highly suited for
+hyperspectral image analysis, enabling:
+    • explicit spectral modeling
+    • prototype interpretability
+    • reduced memory cost
+    • improved robustness on small HSI datasets
+
+"""
 
 class SpectralEncoder(nn.Module):
     """
