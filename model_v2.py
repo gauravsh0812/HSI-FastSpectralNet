@@ -1,294 +1,328 @@
-# optimized_proto_hyperformer.py
+# model.py
+# Optimized version preserving original class names and API.
+# - Same external API as your original file (forward returns {"logits"} or {"loss","logits"})
+# - Latency & FLOP focused internals (depthwise-separable stem, efficient linear attention, layerscale)
+# - Optional AMP and torch.compile in get_latency helper
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from typing import Optional
 
 
-# -----------------------------
-# Utility helpers
-# -----------------------------
-def make_divisible(x, d=8):
+# -------------------------
+# Small helpers
+# -------------------------
+def _make_divisible(x, d=8):
     return int((x + d - 1) // d * d)
 
 
-def freeze_bn_eval(m):  # convenience: no-op but could freeze any BN if present
-    for p in m.parameters():
-        p.requires_grad = p.requires_grad
-
-
-# -----------------------------
-# Fast patch embed: depthwise sep conv + optional norm
-# -----------------------------
-class FastPatchEmbed(nn.Module):
-    def __init__(self, in_bands: int, out_dim: int, patch_size: int):
+# Depthwise-separable patch embed (replaces direct Conv2d for large input channels)
+class _DepthwiseSeparablePatchEmbed(nn.Module):
+    def __init__(self, in_ch, out_dim, patch_size=1):
         super().__init__()
-        # depthwise conv reduces memory traffic for large band counts
-        self.dw = nn.Conv2d(in_bands, in_bands, kernel_size=patch_size, stride=patch_size,
-                            groups=in_bands, bias=False)
-        self.pw = nn.Conv2d(in_bands, out_dim, kernel_size=1, bias=False)
-        # tiny bias-free layernorm on channel dim (applied after flatten)
+        # depthwise conv with stride=patch_size to create non-overlapping patches
+        self.dw = nn.Conv2d(in_ch, in_ch, kernel_size=patch_size, stride=patch_size,
+                            groups=in_ch, bias=False)
+        self.pw = nn.Conv2d(in_ch, out_dim, kernel_size=1, bias=False)
         self.norm = nn.LayerNorm(out_dim)
 
-        # initialize pointwise smaller scale
+        # init
         nn.init.kaiming_normal_(self.dw.weight, nonlinearity='linear')
         nn.init.kaiming_normal_(self.pw.weight, nonlinearity='linear')
 
     def forward(self, x):
         # x: B, C, H, W
-        x = self.dw(x)          # B, C, H', W'
-        x = self.pw(x)          # B, out_dim, H', W'
+        x = self.dw(x)           # B, C, H', W'
+        x = self.pw(x)           # B, out_dim, H', W'
         B, C, H, W = x.shape
-        x = x.reshape(B, C, H * W).permute(0, 2, 1).contiguous()  # B, N, C  (avoid many transposes)
+        x = x.reshape(B, C, H * W).permute(0, 2, 1).contiguous()  # B, N, C
         x = self.norm(x)
         return x
 
 
-# -----------------------------
-# Efficient topk prototype gather (fast indexing)
-# -----------------------------
-def gather_topk_prototypes(prototypes: torch.Tensor, indices: torch.LongTensor, weights: torch.Tensor):
-    # prototypes: (K, D)
-    # indices: (B, N, topk)
-    # weights: (B, N, topk, 1)
-    # returns: (B, N, D)
-    B, N, topk = indices.shape
-    K, D = prototypes.shape
-    # Expand prototypes to batch gather via indexing trick: prototypes[indices] works directly
-    # indices: (B, N, topk) -> prototypes[indices] -> (B, N, topk, D)
-    picked = prototypes[indices]  # uses advanced indexing; yields contiguous tensor on same device
-    # weighted sum
-    mixed = (picked * weights).sum(dim=2)  # (B, N, D)
-    return mixed
-
-
-# -----------------------------
-# Tiny, fast linear attention using low-rank keys (optimized matmuls)
-# - We implement the "attn = softmax(q, dim=-1) @ (K^T @ v)" pattern but avoid big transposes
-# - We keep all tensors contiguous and use bmm where appropriate.
-# -----------------------------
-class FastLinearAttnBlock(nn.Module):
-    def __init__(self, dim: int, ff_hidden: int, layerscale: float = 1e-2):
+# -------------------------
+# SpectralAttention (kept name) - small MLP spectral mixer
+# -------------------------
+class SpectralAttention(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        # We'll implement q_proj and v_proj as smaller linear layers to reduce flops
-        self.norm = nn.LayerNorm(dim)
-        # bias=False to slightly reduce ops (safe when followed by residual)
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        # small FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, ff_hidden, bias=True),
+        # smaller hidden dim for faster inference
+        hidden = max(8, dim // 4)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden, bias=True),
             nn.GELU(),
-            nn.Linear(ff_hidden, dim, bias=True)
+            nn.Linear(hidden, dim, bias=True)
         )
-        # LayerScale: per-channel residual scaling
-        self.gamma1 = nn.Parameter(layerscale * torch.ones((dim,)), requires_grad=True)
-        self.gamma2 = nn.Parameter(layerscale * torch.ones((dim,)), requires_grad=True)
+        # LayerNorm to stabilize spectral output
+        self.norm = nn.LayerNorm(dim)
 
-    def forward(self, x, keys):
-        # x: (B, N, C), keys: (B, N, C) precomputed
+    def forward(self, x):
+        # x: B, C (we expect pooled tokens)
+        return self.mlp(self.norm(x))
+
+
+# -------------------------
+# EfficientAttention (kept name) - optimized linear attention using bmm
+# - This keeps the original semantics but uses efficient batched matmuls and avoids einsum overhead
+# - qkv_bias kept as parameter for API compatibility
+# -------------------------
+class EfficientAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False):
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        # use bias as requested
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x):
+        # x: B, N, C
         B, N, C = x.shape
-        x_norm = self.norm(x)
-        q = self.q_proj(x_norm)      # B,N,C
-        v = self.v_proj(x_norm)      # B,N,C
+        qkv = self.qkv(x)  # B, N, 3C
+        # reshape -> (3, B, heads, N, head_dim)
+        qkv = qkv.view(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each: B, heads, N, head_dim
 
-        # ... HOT PATH: compute per-sample small matmuls with bmm
-        # softmax on last dim across feature dim (NOT typical; we follow Grok formula softmax across channels)
-        # But computing softmax across channels may be heavy if C large; we keep C moderate.
-        q_s = F.softmax(q, dim=-1)   # B,N,C
+        # Apply softmax on keys across token dim for stability (as in your original EfficientAttention)
+        # Note: using dim=-2 (tokens axis) like original code
+        k = k.softmax(dim=-2)  # B, heads, N, head_dim
 
-        # keys.T @ v per token? Grok used keys.transpose(1,2) @ v -> (B, C, C) then q @ that -> (B,N,C)
-        # compute KV = keys.transpose(1,2) @ v  -> shapes: (B, C, N) @ (B, N, C) -> (B, C, C)
-        KV = torch.bmm(keys.transpose(1, 2), v)    # (B, C, C)
+        # context = sum over tokens of k(t) * v(t)
+        # einsum('bhnd,bhne->bhde') -> use bmm by reshaping:
+        # reshape to (B*heads, N, D)
+        B_h = B * self.num_heads
+        k_ = k.reshape(B_h, N, self.head_dim)      # (B*heads, N, D)
+        v_ = v.reshape(B_h, N, self.head_dim)      # (B*heads, N, D)
 
-        # now out = q_s @ KV  -> per token: (B, N, C) @ (B, C, C) -> (B, N, C)
-        # do as bmm by reshaping: q_s.view(B*N,1,C) @ KV.repeat(N,1,1)? that's costly.
-        # Use efficient batched matmul: we can reshape KV to (B,1,C,C) and use torch.matmul broadcasting
-        out = torch.matmul(q_s, KV.unsqueeze(1))  # B, N, 1, C
-        out = out.squeeze(2)                      # B, N, C
+        # compute context = k_.transpose(1,2) @ v_  -> (B*heads, D, D)
+        context = torch.bmm(k_.transpose(1, 2), v_)  # (B*heads, D, D)
 
-        # Apply LayerScale residuals (element-wise multiply across channel dim)
-        x = x + out * self.gamma1
-        x = x + self.ffn(self.norm(x)) * self.gamma2
+        # q_ @ context -> (B*heads, N, D)
+        q_ = q.reshape(B_h, N, self.head_dim)
+        out = torch.bmm(q_, context)  # (B*heads, N, D)
+
+        # restore shape and project
+        out = out.view(B, self.num_heads, N, self.head_dim).permute(0, 2, 1, 3).reshape(B, N, C)
+        out = self.proj(out)
+        return out
+
+
+# -------------------------
+# newViTBlock (kept name) - uses EfficientAttention above + LayerScale + small MLP
+# -------------------------
+class newViTBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, layerscale=True):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = EfficientAttention(dim, num_heads, qkv_bias)
+        self.norm2 = nn.LayerNorm(dim)
+        hidden = int(dim * mlp_ratio)
+        # smaller mlp by default if dim small; keep bias True for numeric stability
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden, bias=True),
+            nn.GELU(),
+            nn.Linear(hidden, dim, bias=True)
+        )
+
+        # LayerScale parameters
+        if layerscale:
+            self.gamma_1 = nn.Parameter(1e-3 * torch.ones(dim))
+            self.gamma_2 = nn.Parameter(1e-3 * torch.ones(dim))
+        else:
+            self.gamma_1 = None
+            self.gamma_2 = None
+
+    def forward(self, x):
+        # Attention
+        attn_out = self.attn(self.norm1(x))
+        if self.gamma_1 is not None:
+            x = x + attn_out * self.gamma_1
+        else:
+            x = x + attn_out
+
+        # MLP
+        mlp_out = self.mlp(self.norm2(x))
+        if self.gamma_2 is not None:
+            x = x + mlp_out * self.gamma_2
+        else:
+            x = x + mlp_out
         return x
 
 
-# -----------------------------
-# Optimized ProtoHyperFormer
-# -----------------------------
-class OptimizedProtoHyperFormer(nn.Module):
-    def __init__(
-        self,
-        in_bands: int = 103,
-        num_classes: int = 9,
-        patch_size: int = 16,
-        dim: int = 192,
-        depth: int = 3,
-        k_spectral: int = 24,
-        k_spatial: int = 24,
-        topk: int = 2,
-        reduced_bands: int = 8,
-        temperature: float = 0.07,
-        use_amp: bool = True
-    ):
+# -------------------------
+# newFastViT (kept name) - main model class (API preserved)
+# - I preserved constructor signature and forward return format
+# - Added optional flags to trade latency/accuracy; defaults keep original behavior but optimize internals
+# -------------------------
+class newFastViT(nn.Module):
+    def __init__(self, image_size=5, patch_size=1, num_channels=103, num_classes=9,
+                 embed_dim=768, depth=6, num_heads=12, mlp_ratio=4.,
+                 token_reduction_factor: int = 1,
+                 use_spectral: bool = True,
+                 qkv_bias: bool = False):
         """
-        Optimized version focused on latency:
-        - aggressive band reduction (default 8)
-        - depthwise separable patch embed
-        - minimal tokens via large patch_size
-        - light FFNs and layer-scale
-        - fast gather/topk with contiguous tensors
-        - use_amp: inference/training with autocast (AMP) for speed
+        Kept external API (names & defaults) but optimized internals for latency:
+        - depthwise-separable patch embedding
+        - efficient linear attention implementation
+        - optional token_reduction_factor (>=1) to reduce token count (trades accuracy for latency)
+        - spectral attention remains but lighter
         """
         super().__init__()
 
+        # keep dims divisible
+        embed_dim = _make_divisible(embed_dim, 8)
+        self.token_reduction_factor = max(1, int(token_reduction_factor))
         self.patch_size = patch_size
-        self.dim = make_divisible(dim, 8)
-        self.topk = topk
-        self.temperature = temperature
-        self.use_amp = use_amp
+        self.use_spectral = use_spectral
 
-        # 1) Band reduction: 1x1 conv -> strongly regularized; small out channels
-        # Use bias=True here for numeric stability (tiny cost)
-        self.band_reduce = nn.Conv2d(in_bands, reduced_bands, kernel_size=1, bias=True)
-        nn.init.kaiming_normal_(self.band_reduce.weight, nonlinearity='linear')
+        # Depthwise separable patch embed
+        self.patch_embed = _DepthwiseSeparablePatchEmbed(num_channels, embed_dim, patch_size=patch_size)
 
-        # 2) Fast patch embed (depthwise + pointwise)
-        self.patch_embed = FastPatchEmbed(reduced_bands, self.dim, patch_size=patch_size)
+        # Positional embedding: store max tokens for the default image_size and patch_size,
+        # but allow interpolation in forward
+        seq_len = (image_size // patch_size) ** 2
+        reduced_seq = (seq_len + self.token_reduction_factor - 1) // self.token_reduction_factor
+        self.pos_embed = nn.Parameter(torch.zeros(1, reduced_seq, embed_dim))
 
-        # compute token count per image (we keep pos_embed minimal)
-        # pos embedding kept as small param if needed; we'll use simple learned token bias per token count
-        # but for generality we create pos as length 1 and broadcast (works when tokens tiny)
-        self.register_buffer('pos_bias', torch.zeros(1, 1, self.dim), persistent=False)
+        # Blocks
+        self.blocks = nn.ModuleList([
+            newViTBlock(embed_dim, num_heads, mlp_ratio, qkv_bias, layerscale=True)
+            for _ in range(depth)
+        ])
 
-        # Prototype banks (small)
-        self.spectral_prototypes = nn.Parameter(torch.randn(k_spectral, reduced_bands) * 0.02)
-        self.spatial_prototypes = nn.Parameter(torch.randn(k_spatial, self.dim) * 0.02)
+        # Lighter spectral attention (pool + small mlp)
+        if use_spectral:
+            self.spectral_attention = SpectralAttention(embed_dim)
+        else:
+            self.spectral_attention = nn.Identity()
 
-        # Router: tiny MLP (shared)
-        self.router = nn.Sequential(
-            nn.Linear(self.dim, 128, bias=True),
-            nn.GELU(),
-            nn.Linear(128, k_spectral + k_spatial, bias=True)
-        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
 
-        # key projection: combine spectral and spatial mixed protos -> shorter projection
-        self.key_proj = nn.Linear(reduced_bands + self.dim, self.dim, bias=False)
-
-        # Blocks: extremely light
-        ff_hidden = max(64, int(self.dim * 2))  # smaller than original 4x
-        self.blocks = nn.ModuleList([FastLinearAttnBlock(self.dim, ff_hidden) for _ in range(depth)])
-
-        self.norm = nn.LayerNorm(self.dim)
-        self.head = nn.Linear(self.dim, num_classes, bias=True)
-
-        # initialization: small
+        # initialization
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.normal_(self.head.weight, std=0.01)
         if self.head.bias is not None:
             nn.init.zeros_(self.head.bias)
 
-    def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None):
+    def _reduce_tokens(self, x):
+        # x: B, N, C
+        r = self.token_reduction_factor
+        if r == 1:
+            return x
+        B, N, C = x.shape
+        # pad if necessary
+        pad = (r - (N % r)) % r
+        if pad:
+            # simple pad by repeating first tokens (cheap)
+            pad_tensor = x[:, :pad, :].contiguous()
+            x = torch.cat([x, pad_tensor], dim=1)
+            N = x.shape[1]
+        # reshape and mean
+        x = x.view(B, N // r, r, C).mean(dim=2)
+        return x
+
+    def forward(self, x, labels: Optional[torch.Tensor] = None):
         """
-        x: (B, in_bands, H, W)
+        x: B, C, H, W
+        returns: {"logits": logits} or {"loss": loss, "logits": logits}
         """
-        # Use autocast for faster fp16 matmuls on GPU when enabled
-        if self.use_amp and x.is_cuda:
-            return self._forward_amp(x, labels)
+        # 1) patch embed
+        x = self.patch_embed(x)  # B, N, C
+
+        # 2) token reduction (optional)
+        x = self._reduce_tokens(x)  # B, N', C
+
+        # 3) pos embedding (interpolate if length mismatch)
+        if x.shape[1] != self.pos_embed.shape[1]:
+            # interpolate pos embeddings over token dimension
+            p = F.interpolate(self.pos_embed.permute(0, 2, 1), size=x.shape[1], mode='linear', align_corners=False)
+            p = p.permute(0, 2, 1)
+            x = x + p
         else:
-            return self._forward_nomix(x, labels)
+            x = x + self.pos_embed
 
-    def _forward_amp(self, x, labels=None):
-        # Keep operations inside torch.cuda.amp.autocast for faster inference/training
-        with torch.cuda.amp.autocast():
-            return self._forward_nomix(x, labels)
-
-    def _forward_nomix(self, x, labels=None):
-        B = x.shape[0]
-        # 1) Band reduction
-        x_reduced = self.band_reduce(x)        # (B, reduced_bands, H, W)
-
-        # 2) Patch embed -> B,N,C
-        x_tok = self.patch_embed(x_reduced)    # (B, N, dim)
-
-        # 3) Router predicts per-token logits to pick prototypes
-        router_logits = self.router(x_tok)     # (B, N, k_spectral + k_spatial)
-        k_s = self.spectral_prototypes.shape[0]
-
-        spect_logits = router_logits[..., :k_s]      # (B,N,k_s)
-        spat_logits = router_logits[..., k_s:]       # (B,N,k_p)
-
-        # 4) Top-k selection (small topk)
-        # topk values and indices for spectral & spatial banks
-        s_vals, s_idx = torch.topk(spect_logits, k=self.topk, dim=-1, largest=True, sorted=False)  # (B,N,topk)
-        p_vals, p_idx = torch.topk(spat_logits,  k=self.topk, dim=-1, largest=True, sorted=False)
-
-        # Softmax weights per-token/topk (temperature controls sharpness)
-        w_s = F.softmax(s_vals / (self.temperature + 1e-8), dim=-1).unsqueeze(-1)  # (B,N,topk,1)
-        w_p = F.softmax(p_vals / (self.temperature + 1e-8), dim=-1).unsqueeze(-1)
-
-        # 5) Gather prototypes -> (B,N,D)
-        # prototypes are small; gather_topk_prototypes uses advanced indexing (fast)
-        spect_mixed = gather_topk_prototypes(self.spectral_prototypes, s_idx, w_s)  # (B,N,reduced_bands)
-        spat_mixed = gather_topk_prototypes(self.spatial_prototypes, p_idx, w_p)     # (B,N,dim)
-
-        # 6) Combine & project to keys
-        # cat along feature dim and project: keep contiguous for bmm later
-        combined = torch.cat([spect_mixed, spat_mixed], dim=-1)  # (B,N, reduced_bands + dim)
-        keys = self.key_proj(combined)                           # (B,N,dim)
-
-        # 7) Optionally add a learned per-token bias (small)
-        # pos_bias broadcast (1,1,C) -> (B,N,C) via expand (no allocation when N=1)
-        if keys.shape[1] == 1:
-            keys = keys + self.pos_bias  # broadcast safe
-        else:
-            keys = keys + self.pos_bias.expand(1, keys.shape[1], -1)
-
-        # 8) Attention blocks: use fast bmm-based matmuls
-        x = x_tok
+        # 4) transformer blocks
         for blk in self.blocks:
-            x = blk(x, keys)
+            x = blk(x)
 
-        # 9) Pooling + head
-        feat = self.norm(x.mean(dim=1))  # (B, C)
-        logits = self.head(feat)
+        # 5) spectral attention (global)
+        # keep spectral on pooled representation to be cheap
+        pooled = x.mean(dim=1)  # B, C
+        if self.use_spectral:
+            pooled = self.spectral_attention(pooled)  # B, C (mlp)
+        # 6) head
+        logits = self.head(self.norm(pooled))
 
         if labels is not None:
-            loss = F.cross_entropy(logits, labels)
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
             return {"loss": loss, "logits": logits}
         return {"logits": logits}
 
     # -------------------------
-    # Helpers
+    # Latency helper (preserves your earlier style but improved)
     # -------------------------
     @torch.no_grad()
-    def get_latency(self, input_shape=(1, 103, 145, 145), device='cuda', repeats: int = 200, warmup: int = 30,
-                    use_compile: bool = True):
+    def get_latency(self, input_shape=(1, 103, 145, 145), device='cuda', repeats=200, warmup=30,
+                    use_amp: bool = True, use_compile: bool = True):
         """
-        Measure median latency (ms) using AMP & optional torch.compile.
-        Run with device='cuda' for GPU timings. This warms up and then measures `repeats` runs.
+        Measure average latency (ms) for forward() over `repeats` runs after `warmup`.
+        - use_amp: if True and device is CUDA, uses torch.cuda.amp.autocast during runs (simulates mixed precision path)
+        - use_compile: if True and torch.compile available, attempt to compile the model once before timing
         """
         self.eval()
         self.to(device)
-        if use_compile and hasattr(torch, 'compile'):
+
+        # optional compile (wrap model ref returned by torch.compile)
+        compiled_model = self
+        if use_compile and hasattr(torch, "compile"):
             try:
-                # compile with a simple wrapper for forward signature
-                self = torch.compile(self)
-                print("[info] torch.compile applied.")
-            except Exception as e:
-                print("[warn] torch.compile failed:", e)
+                compiled_model = torch.compile(self)
+            except Exception:
+                compiled_model = self
 
         x = torch.randn(input_shape, device=device)
         # Warmup
         for _ in range(warmup):
-            _ = self(x)
+            if use_amp and device.startswith('cuda'):
+                with torch.cuda.amp.autocast():
+                    _ = compiled_model(x)
+            else:
+                _ = compiled_model(x)
 
-        # timing
         torch.cuda.synchronize()
         import time
         t0 = time.time()
         for _ in range(repeats):
-            _ = self(x)
+            if use_amp and device.startswith('cuda'):
+                with torch.cuda.amp.autocast():
+                    _ = compiled_model(x)
+            else:
+                _ = compiled_model(x)
         torch.cuda.synchronize()
         elapsed = (time.time() - t0) / repeats * 1000.0
-        print(f"Avg latency over {repeats} runs: {elapsed:.3f} ms")
+        print(f"Average latency ({repeats} runs): {elapsed:.3f} ms")
         return elapsed
+
+
+# -------------------------
+# Quick smoke test when run directly
+# -------------------------
+if __name__ == "__main__":
+    # match your earlier default signature
+    model = newFastViT(image_size=145, patch_size=5, num_channels=103, num_classes=9,
+                       embed_dim=384, depth=4, num_heads=8, mlp_ratio=2.0,
+                       token_reduction_factor=2, use_spectral=True)
+    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    x = torch.randn(1, 103, 145, 145)
+    out = model(x)
+    print("Output keys:", out.keys())
+    print("Logits shape:", out["logits"].shape)
+
+    # Uncomment to run latency test on GPU (requires CUDA)
+    # model.get_latency(input_shape=(1,103,145,145), device='cuda', repeats=200, warmup=30)
