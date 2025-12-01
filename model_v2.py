@@ -1,210 +1,294 @@
-# proto_hyperformer.py
-# Ultra-fast ProtoHyperFormer — 6–15 ms, 180k params, CVPR 2026 ready
-# Just run: python proto_hyperformer.py
-
+# optimized_proto_hyperformer.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import scipy.io as sio
-import numpy as np
-from sklearn.metrics import accuracy_score, cohen_kappa_score
-import time
-import os
+from typing import Optional
 
-# ====================== CONFIG ======================
-PATCH_SIZE = 24          # 24×24 → very few tokens (Indian Pines: 36 tokens!)
-DIM = 192                # embedding dimension
-DEPTH = 4                # only 4 blocks
-NUM_HEADS = 4
-K_SPECTRAL = 32          # spectral prototypes
-K_SPATIAL = 32           # spatial prototypes
-TOPK = 3                 # top-3 per bank → max 6 mixtures
-BANDS_REDUCED = 24       # reduce from 200/103/144 → 24
-TEMPERATURE = 0.1
-NUM_CLASSES = 16         # change per dataset below
-DATASET = "IP"           # "IP", "PaviaU", "Houston", "Salinas", "KSC"
-# =====================================================
 
-class PatchEmbed(nn.Module):
-    def __init__(self, patch_size=24, in_chans=24, embed_dim=192):
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def make_divisible(x, d=8):
+    return int((x + d - 1) // d * d)
+
+
+def freeze_bn_eval(m):  # convenience: no-op but could freeze any BN if present
+    for p in m.parameters():
+        p.requires_grad = p.requires_grad
+
+
+# -----------------------------
+# Fast patch embed: depthwise sep conv + optional norm
+# -----------------------------
+class FastPatchEmbed(nn.Module):
+    def __init__(self, in_bands: int, out_dim: int, patch_size: int):
         super().__init__()
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        self.patch_size = patch_size
+        # depthwise conv reduces memory traffic for large band counts
+        self.dw = nn.Conv2d(in_bands, in_bands, kernel_size=patch_size, stride=patch_size,
+                            groups=in_bands, bias=False)
+        self.pw = nn.Conv2d(in_bands, out_dim, kernel_size=1, bias=False)
+        # tiny bias-free layernorm on channel dim (applied after flatten)
+        self.norm = nn.LayerNorm(out_dim)
+
+        # initialize pointwise smaller scale
+        nn.init.kaiming_normal_(self.dw.weight, nonlinearity='linear')
+        nn.init.kaiming_normal_(self.pw.weight, nonlinearity='linear')
 
     def forward(self, x):
+        # x: B, C, H, W
+        x = self.dw(x)          # B, C, H', W'
+        x = self.pw(x)          # B, out_dim, H', W'
         B, C, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)  # B, N, D
+        x = x.reshape(B, C, H * W).permute(0, 2, 1).contiguous()  # B, N, C  (avoid many transposes)
+        x = self.norm(x)
         return x
 
-class LinearAttentionBlock(nn.Module):
-    def __init__(self, dim=192):
+
+# -----------------------------
+# Efficient topk prototype gather (fast indexing)
+# -----------------------------
+def gather_topk_prototypes(prototypes: torch.Tensor, indices: torch.LongTensor, weights: torch.Tensor):
+    # prototypes: (K, D)
+    # indices: (B, N, topk)
+    # weights: (B, N, topk, 1)
+    # returns: (B, N, D)
+    B, N, topk = indices.shape
+    K, D = prototypes.shape
+    # Expand prototypes to batch gather via indexing trick: prototypes[indices] works directly
+    # indices: (B, N, topk) -> prototypes[indices] -> (B, N, topk, D)
+    picked = prototypes[indices]  # uses advanced indexing; yields contiguous tensor on same device
+    # weighted sum
+    mixed = (picked * weights).sum(dim=2)  # (B, N, D)
+    return mixed
+
+
+# -----------------------------
+# Tiny, fast linear attention using low-rank keys (optimized matmuls)
+# - We implement the "attn = softmax(q, dim=-1) @ (K^T @ v)" pattern but avoid big transposes
+# - We keep all tensors contiguous and use bmm where appropriate.
+# -----------------------------
+class FastLinearAttnBlock(nn.Module):
+    def __init__(self, dim: int, ff_hidden: int, layerscale: float = 1e-2):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        # We'll implement q_proj and v_proj as smaller linear layers to reduce flops
+        self.norm = nn.LayerNorm(dim)
+        # bias=False to slightly reduce ops (safe when followed by residual)
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        # small FFN
         self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
+            nn.Linear(dim, ff_hidden, bias=True),
             nn.GELU(),
-            nn.Linear(dim * 4, dim)
+            nn.Linear(ff_hidden, dim, bias=True)
         )
-        self.proj_q = nn.Linear(dim, dim)
-        self.proj_v = nn.Linear(dim, dim)
+        # LayerScale: per-channel residual scaling
+        self.gamma1 = nn.Parameter(layerscale * torch.ones((dim,)), requires_grad=True)
+        self.gamma2 = nn.Parameter(layerscale * torch.ones((dim,)), requires_grad=True)
 
     def forward(self, x, keys):
-        # x: B, N, D
-        # keys: B, N, D  (pre-computed prototype-mixed keys)
-        B, N, D = x.shape
+        # x: (B, N, C), keys: (B, N, C) precomputed
+        B, N, C = x.shape
+        x_norm = self.norm(x)
+        q = self.q_proj(x_norm)      # B,N,C
+        v = self.v_proj(x_norm)      # B,N,C
 
-        q = self.proj_q(self.norm1(x))           # B,N,D
-        v = self.proj_v(self.norm1(x))           # B,N,D
+        # ... HOT PATH: compute per-sample small matmuls with bmm
+        # softmax on last dim across feature dim (NOT typical; we follow Grok formula softmax across channels)
+        # But computing softmax across channels may be heavy if C large; we keep C moderate.
+        q_s = F.softmax(q, dim=-1)   # B,N,C
 
-        # Linear attention using pre-computed keys (rank ≤ 64)
-        attn = F.softmax(q, dim=-1) @ (keys.transpose(1,2) @ v)   # B,N,D
-        x = x + attn
-        x = x + self.ffn(self.norm2(x))
+        # keys.T @ v per token? Grok used keys.transpose(1,2) @ v -> (B, C, C) then q @ that -> (B,N,C)
+        # compute KV = keys.transpose(1,2) @ v  -> shapes: (B, C, N) @ (B, N, C) -> (B, C, C)
+        KV = torch.bmm(keys.transpose(1, 2), v)    # (B, C, C)
+
+        # now out = q_s @ KV  -> per token: (B, N, C) @ (B, C, C) -> (B, N, C)
+        # do as bmm by reshaping: q_s.view(B*N,1,C) @ KV.repeat(N,1,1)? that's costly.
+        # Use efficient batched matmul: we can reshape KV to (B,1,C,C) and use torch.matmul broadcasting
+        out = torch.matmul(q_s, KV.unsqueeze(1))  # B, N, 1, C
+        out = out.squeeze(2)                      # B, N, C
+
+        # Apply LayerScale residuals (element-wise multiply across channel dim)
+        x = x + out * self.gamma1
+        x = x + self.ffn(self.norm(x)) * self.gamma2
         return x
 
-class ProtoHyperFormer(nn.Module):
-    def __init__(self, in_bands=200, num_classes=16):
+
+# -----------------------------
+# Optimized ProtoHyperFormer
+# -----------------------------
+class OptimizedProtoHyperFormer(nn.Module):
+    def __init__(
+        self,
+        in_bands: int = 103,
+        num_classes: int = 9,
+        patch_size: int = 16,
+        dim: int = 192,
+        depth: int = 3,
+        k_spectral: int = 24,
+        k_spatial: int = 24,
+        topk: int = 2,
+        reduced_bands: int = 8,
+        temperature: float = 0.07,
+        use_amp: bool = True
+    ):
+        """
+        Optimized version focused on latency:
+        - aggressive band reduction (default 8)
+        - depthwise separable patch embed
+        - minimal tokens via large patch_size
+        - light FFNs and layer-scale
+        - fast gather/topk with contiguous tensors
+        - use_amp: inference/training with autocast (AMP) for speed
+        """
         super().__init__()
-        # 1. Band reduction
-        self.band_reduce = nn.Conv2d(in_bands, BANDS_REDUCED, kernel_size=1)
 
-        # 2. Patch embedding
-        self.patch_embed = PatchEmbed(patch_size=PATCH_SIZE, in_chans=BANDS_REDUCED, embed_dim=DIM)
+        self.patch_size = patch_size
+        self.dim = make_divisible(dim, 8)
+        self.topk = topk
+        self.temperature = temperature
+        self.use_amp = use_amp
 
-        # 3. Prototype banks ← HERE ARE THE PROTOTYPES
-        self.spectral_prototypes = nn.Parameter(torch.randn(K_SPECTRAL, BANDS_REDUCED) * 0.02)
-        self.spatial_prototypes  = nn.Parameter(torch.randn(K_SPATIAL, DIM) * 0.02)
+        # 1) Band reduction: 1x1 conv -> strongly regularized; small out channels
+        # Use bias=True here for numeric stability (tiny cost)
+        self.band_reduce = nn.Conv2d(in_bands, reduced_bands, kernel_size=1, bias=True)
+        nn.init.kaiming_normal_(self.band_reduce.weight, nonlinearity='linear')
 
-        # 4. Single router for both banks
+        # 2) Fast patch embed (depthwise + pointwise)
+        self.patch_embed = FastPatchEmbed(reduced_bands, self.dim, patch_size=patch_size)
+
+        # compute token count per image (we keep pos_embed minimal)
+        # pos embedding kept as small param if needed; we'll use simple learned token bias per token count
+        # but for generality we create pos as length 1 and broadcast (works when tokens tiny)
+        self.register_buffer('pos_bias', torch.zeros(1, 1, self.dim), persistent=False)
+
+        # Prototype banks (small)
+        self.spectral_prototypes = nn.Parameter(torch.randn(k_spectral, reduced_bands) * 0.02)
+        self.spatial_prototypes = nn.Parameter(torch.randn(k_spatial, self.dim) * 0.02)
+
+        # Router: tiny MLP (shared)
         self.router = nn.Sequential(
-            nn.Linear(DIM, 256),
+            nn.Linear(self.dim, 128, bias=True),
             nn.GELU(),
-            nn.Linear(256, K_SPECTRAL + K_SPATIAL)
+            nn.Linear(128, k_spectral + k_spatial, bias=True)
         )
 
-        # 5. Final key projection
-        self.key_proj = nn.Linear(BANDS_REDUCED + DIM, DIM)
+        # key projection: combine spectral and spatial mixed protos -> shorter projection
+        self.key_proj = nn.Linear(reduced_bands + self.dim, self.dim, bias=False)
 
-        # 6. Transformer blocks
-        self.blocks = nn.ModuleList([LinearAttentionBlock(DIM) for _ in range(DEPTH)])
+        # Blocks: extremely light
+        ff_hidden = max(64, int(self.dim * 2))  # smaller than original 4x
+        self.blocks = nn.ModuleList([FastLinearAttnBlock(self.dim, ff_hidden) for _ in range(depth)])
 
-        self.norm = nn.LayerNorm(DIM)
-        self.head = nn.Linear(DIM, num_classes)
+        self.norm = nn.LayerNorm(self.dim)
+        self.head = nn.Linear(self.dim, num_classes, bias=True)
 
-    def forward(self, x):
+        # initialization: small
+        nn.init.normal_(self.head.weight, std=0.01)
+        if self.head.bias is not None:
+            nn.init.zeros_(self.head.bias)
+
+    def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None):
+        """
+        x: (B, in_bands, H, W)
+        """
+        # Use autocast for faster fp16 matmuls on GPU when enabled
+        if self.use_amp and x.is_cuda:
+            return self._forward_amp(x, labels)
+        else:
+            return self._forward_nomix(x, labels)
+
+    def _forward_amp(self, x, labels=None):
+        # Keep operations inside torch.cuda.amp.autocast for faster inference/training
+        with torch.cuda.amp.autocast():
+            return self._forward_nomix(x, labels)
+
+    def _forward_nomix(self, x, labels=None):
         B = x.shape[0]
-        x = self.band_reduce(x)                     # B,24,H,W
-        x = self.patch_embed(x)                     # B,N,D
+        # 1) Band reduction
+        x_reduced = self.band_reduce(x)        # (B, reduced_bands, H, W)
 
-        # === PROTOTYPE ROUTING (the core) ===
-        logits = self.router(x)                     # B,N,64
-        spect_logits = logits[..., :K_SPECTRAL]
-        spat_logits  = logits[..., K_SPATIAL:]
+        # 2) Patch embed -> B,N,C
+        x_tok = self.patch_embed(x_reduced)    # (B, N, dim)
 
-        # Top-k selection
-        topk_spect_val, topk_spect_idx = torch.topk(spect_logits, k=TOPK, dim=-1)
-        topk_spat_val,  topk_spat_idx  = torch.topk(spat_logits,  k=TOPK, dim=-1)
+        # 3) Router predicts per-token logits to pick prototypes
+        router_logits = self.router(x_tok)     # (B, N, k_spectral + k_spatial)
+        k_s = self.spectral_prototypes.shape[0]
 
-        w_s = F.softmax(topk_spect_val / TEMPERATURE, dim=-1)[..., None]   # B,N,TOPK,1
-        w_p = F.softmax(topk_spat_val  / TEMPERATURE, dim=-1)[..., None]
+        spect_logits = router_logits[..., :k_s]      # (B,N,k_s)
+        spat_logits = router_logits[..., k_s:]       # (B,N,k_p)
 
-        # Gather prototypes
-        spect_proto = (self.spectral_prototypes[topk_spect_idx] * w_s).sum(-2)  # B,N,24
-        spat_proto  = (self.spatial_prototypes[topk_spat_idx]  * w_p).sum(-2)  # B,N,D
+        # 4) Top-k selection (small topk)
+        # topk values and indices for spectral & spatial banks
+        s_vals, s_idx = torch.topk(spect_logits, k=self.topk, dim=-1, largest=True, sorted=False)  # (B,N,topk)
+        p_vals, p_idx = torch.topk(spat_logits,  k=self.topk, dim=-1, largest=True, sorted=False)
 
-        # Final keys from prototype mixtures
-        keys = self.key_proj(torch.cat([spect_proto, spat_proto], dim=-1))     # B,N,D
+        # Softmax weights per-token/topk (temperature controls sharpness)
+        w_s = F.softmax(s_vals / (self.temperature + 1e-8), dim=-1).unsqueeze(-1)  # (B,N,topk,1)
+        w_p = F.softmax(p_vals / (self.temperature + 1e-8), dim=-1).unsqueeze(-1)
 
-        # === Transformer blocks with linear attention ===
+        # 5) Gather prototypes -> (B,N,D)
+        # prototypes are small; gather_topk_prototypes uses advanced indexing (fast)
+        spect_mixed = gather_topk_prototypes(self.spectral_prototypes, s_idx, w_s)  # (B,N,reduced_bands)
+        spat_mixed = gather_topk_prototypes(self.spatial_prototypes, p_idx, w_p)     # (B,N,dim)
+
+        # 6) Combine & project to keys
+        # cat along feature dim and project: keep contiguous for bmm later
+        combined = torch.cat([spect_mixed, spat_mixed], dim=-1)  # (B,N, reduced_bands + dim)
+        keys = self.key_proj(combined)                           # (B,N,dim)
+
+        # 7) Optionally add a learned per-token bias (small)
+        # pos_bias broadcast (1,1,C) -> (B,N,C) via expand (no allocation when N=1)
+        if keys.shape[1] == 1:
+            keys = keys + self.pos_bias  # broadcast safe
+        else:
+            keys = keys + self.pos_bias.expand(1, keys.shape[1], -1)
+
+        # 8) Attention blocks: use fast bmm-based matmuls
+        x = x_tok
         for blk in self.blocks:
             x = blk(x, keys)
 
-        x = self.norm(x.mean(dim=1))   # global average pooling
-        return self.head(x)
+        # 9) Pooling + head
+        feat = self.norm(x.mean(dim=1))  # (B, C)
+        logits = self.head(feat)
 
-# ====================== DATA LOADING (standard HSI) ======================
-def load_data(name):
-    if name == "IP":
-        data = sio.loadmat('Indian_pines_corrected.mat')['indian_pines_corrected']
-        labels = sio.loadmat('Indian_pines_gt.mat')['indian_pines_gt']
-        num_classes = 16
-    elif name == "PaviaU":
-        data = sio.loadmat('PaviaU.mat')['paviaU']
-        labels = sio.loadmat('PaviaU_gt.mat')['paviaU_gt']
-        num_classes = 9
-    elif name == "Houston":
-        data = sio.loadmat('Houston2013.mat')['houston2013']
-        labels = sio.loadmat('Houston2013_gt.mat')['houston2013_gt']
-        num_classes = 15
-    elif name == "Salinas":
-        data = sio.loadmat('Salinas_corrected.mat')['salinas_corrected']
-        labels = sio.loadmat('Salinas_gt.mat')['salinas_gt']
-        num_classes = 16
-    elif name == "KSC":
-        data = sio.loadmat('KSC.mat')['KSC']
-        labels = sio.loadmat('KSC_gt.mat')['KSC_gt']
-        num_classes = 13
-    return data, labels, num_classes
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+            return {"loss": loss, "logits": logits}
+        return {"logits": logits}
 
-# Simple training loop (10% labeled)
-def train_and_test():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data, gt, num_classes = load_data(DATASET)
-    data = torch.FloatTensor(data).permute(2,0,1).unsqueeze(0)  # 1,C,H,W
-    gt = torch.LongTensor(gt)
+    # -------------------------
+    # Helpers
+    # -------------------------
+    @torch.no_grad()
+    def get_latency(self, input_shape=(1, 103, 145, 145), device='cuda', repeats: int = 200, warmup: int = 30,
+                    use_compile: bool = True):
+        """
+        Measure median latency (ms) using AMP & optional torch.compile.
+        Run with device='cuda' for GPU timings. This warms up and then measures `repeats` runs.
+        """
+        self.eval()
+        self.to(device)
+        if use_compile and hasattr(torch, 'compile'):
+            try:
+                # compile with a simple wrapper for forward signature
+                self = torch.compile(self)
+                print("[info] torch.compile applied.")
+            except Exception as e:
+                print("[warn] torch.compile failed:", e)
 
-    model = ProtoHyperFormer(in_bands=data.shape[1], num_classes=num_classes).to(device)
-    model = torch.compile(model, mode="max-autotune")  # ← magic 2–3× speedup
+        x = torch.randn(input_shape, device=device)
+        # Warmup
+        for _ in range(warmup):
+            _ = self(x)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
-
-    # Random 10% labeled (standard split)
-    h, w = gt.shape
-    idx = np.arange(h*w)
-    np.random.shuffle(idx)
-    train_idx = idx[:int(0.1 * len(idx))]
-    test_idx = idx[int(0.1 * len(idx)):]
-
-    train_labels = gt.flatten()[train_idx]
-    test_labels  = gt.flatten()[test_idx]
-
-    model.train()
-    for epoch in range(80):
-        optimizer.zero_grad()
-        out = model(data.to(device))
-        loss = criterion(out[0, train_idx], train_labels.to(device))
-        loss.backward()
-        optimizer.step()
-        if epoch % 20 == 0:
-            print(f"Epoch {epoch} loss: {loss.item():.4f}")
-
-    # ==================== INFERENCE & LATENCY ====================
-    model.eval()
-    torch.cuda.synchronize()
-    starter = torch.cuda.Event(enable_timing=True)
-    ender = torch.cuda.Event(enable_timing=True)
-
-    with torch.no_grad():
-        times = []
-        for _ in range(100):
-            starter.record()
-            out = model(data.to(device))
-            ender.record()
-            torch.cuda.synchronize()
-            times.append(starter.elapsed_time(ender))
-        latency = np.mean(times[10:])  # warmup skip
-        print(f"\n=== FINAL RESULTS ===")
-        print(f"Latency: {latency:.2f} ms")
-        print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-        pred = out[0].argmax(dim=1).cpu().numpy().flatten()[test_idx]
-        true = test_labels.numpy()
-        oa = accuracy_score(true, pred) * 100
-        kappa = cohen_kappa_score(true, pred)
-        print(f"OA: {oa:.2f}%   Kappa: {kappa:.4f}")
-
-if __name__ == "__main__":
-    train_and_test()
+        # timing
+        torch.cuda.synchronize()
+        import time
+        t0 = time.time()
+        for _ in range(repeats):
+            _ = self(x)
+        torch.cuda.synchronize()
+        elapsed = (time.time() - t0) / repeats * 1000.0
+        print(f"Avg latency over {repeats} runs: {elapsed:.3f} ms")
+        return elapsed
