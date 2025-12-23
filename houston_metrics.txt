@@ -1,0 +1,21 @@
+Houston dataset best model performance
+
+==================================================
+Classification Metrics
+==================================================
+Overall Accuracy (OA):     0.9640
+Average Accuracy (AA):      0.9476
+Kappa Coefficient:          0.9390
+F1 Score (weighted):         0.9639
+Precision (weighted):        0.9638
+Recall (weighted):           0.9640
+==================================================
+
+
+Performance Metrics
+==================================================
+Latency per image:          0.1133 ms
+Throughput:                  7876.00 samples/sec
+Model Parameters:            2.15 M
+GFLOPs:                      0.00
+==================================================
